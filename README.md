@@ -176,3 +176,57 @@ docker compose stop order-grpc     # apagar Pedidos
 # El resto de los endpoints sigue respondiendo con normalidad.
 docker compose start order-grpc    # volver a encenderlo
 ```
+
+# ¿Cómo viaja un token entre microservicios?
+
+Propagación de identidad en arquitecturas distribuidas: del gateway al último POD de la cadena.
+OAuth2 / OIDC | JWT | Service Mesh | Token Exchange
+
+### 1. La idea en una frase
+
+El token no se "guarda" en ningún lado compartido entre PODs. Se reenvía, petición por petición, como parte del contexto de esa llamada específica.
+
+```mermaid
+flowchart LR
+    Cliente["Cliente"] -->|Bearer token| Gateway["API Gateway<br/><small>valida el JWT</small>"]
+    Gateway -->|mismo token| ServicioA["Servicio A<br/><small>POD 1</small>"]
+    ServicioA -->|reenvía token| ServicioB["Servicio B<br/><small>POD 2</small>"]
+
+    style Cliente fill:#1c2538,stroke:#2a3550,color:#e8ecf4
+    style Gateway fill:#1c2538,stroke:#5b8cff,stroke-width:2px,color:#e8ecf4
+    style ServicioA fill:#1c2538,stroke:#36c99e,stroke-width:2px,color:#e8ecf4
+    style ServicioB fill:#1c2538,stroke:#b48cff,stroke-width:2px,color:#e8ecf4
+
+```
+
+El mismo `Authorization: Bearer <token>` viaja de salto en salto, en cada request.
+
+### 2. El flujo completo, paso a paso
+
+- **El usuario se autentica** contra el Identity Provider (Keycloak, Auth0, Cognito, Okta...).Recibe un JWT firmado, con claims como `sub`, `scope`, `exp`.
+- **El cliente llama a la API** enviando el token en el header.`Authorization: Bearer eyJhbGciOi...`
+- **El API Gateway / Ingress valida el token** (firma, expiración, issuer).Puede rechazarlo ahí mismo si está vencido o mal formado — ni siquiera llega a los servicios internos.
+- **El Servicio A recibe la request** con el token ya validado y necesita llamar al Servicio B.Un interceptor / middleware copia automáticamente el header entrante al request saliente.
+- **El Servicio B valida el token otra vez** (sí, otra vez — cada servicio es responsable de su propia seguridad).Esto se llama _"zero trust"_: no confiar en que "ya alguien lo validó antes".
+- **Si hace falta, se pide un token acotado** vía Token Exchange, en vez de pasar el original con todos los permisos.Útil cuando B no debería tener el mismo nivel de acceso que tenía el usuario original.
+
+
+### 3. Las dos formas de propagarlo
+
+En la práctica vas a ver dos enfoques, y no son mutuamente excluyentes.
+
+| Manual / por código<br>                                                                                                       | Infraestructura                                                                                                       |
+| ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Interceptores en cada servicio                                                                                                | Service Mesh (Istio, Linkerd)                                                                                         |
+| Cada servicio, al hacer su llamada saliente, extrae el token del contexto de la request entrante y lo inyecta en la saliente. | El sidecar (Envoy) se encarga de validar y/o propagar contexto, sin que el código de negocio tenga que pensar en eso. |
+
+
+### 4. Resumen
+
+|Mecanismo|Cuándo usarlo|
+|---|---|
+|Reenvío manual del header|Pocos servicios, equipos chicos, control total del código|
+|Interceptor / middleware automático|Varios servicios en el mismo stack, querés evitar "se me olvidó"|
+|Service Mesh (Istio/Linkerd)|Muchos servicios, en Kubernetes, querés separar identidad de red de identidad de usuario|
+|Token Exchange|Cuando un servicio downstream no debería heredar todos los permisos del token original|
+|Claims en payload / token de servicio|Comunicación asíncrona (colas, eventos)|
